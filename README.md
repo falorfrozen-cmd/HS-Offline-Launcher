@@ -13,7 +13,7 @@ A simple Windows launcher for playing the Steam edition of Hero Siege offline.
 ## Usage
 
 1. Own and install Hero Siege through Steam.
-2. Download and open `HS Offline Launcher.exe` from the latest release.
+2. Download and open `HS-Offline-Launcher.exe` from the latest release.
 3. Confirm that the selected path ends in `HeroSiege\bin\Hero_Siege.exe`.
 4. Press **Launch Hero Siege Offline**.
 5. Use offline/single-player characters only.
