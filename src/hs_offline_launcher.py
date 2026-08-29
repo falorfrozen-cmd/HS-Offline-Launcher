@@ -30,6 +30,7 @@ APP_NAME = "HS Offline Launcher"
 PORTS = (8861, 8862, 8863, 8961)
 STATE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "HSOfflineLauncher"
 CONFIG_PATH = STATE_DIR / "config.json"
+ACTION_LOG_PATH = STATE_DIR / "launcher.log"
 
 KNOWN_BUILDS = {
     "0766aa8bfc6eb5679df46f78546644e34fae333adc22474f96903c1d68f251f5": "Season 10 · 2026.08.24",
@@ -39,12 +40,25 @@ KNOWN_BUILDS = {
 CREATE_NO_WINDOW = 0x08000000
 WEBVIEW_WINDOW = None
 SERVER = None
+SERVER_THREAD = None
 LAST_LAUNCH = {"pid": 0, "time": "", "message": "Ready"}
 HASH_CACHE: dict[tuple[str, int, int], str] = {}
 
 
 def ensure_state_dir() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log_action(message: str) -> None:
+    """Keep a small local diagnostic for UI actions reported by users."""
+    try:
+        ensure_state_dir()
+        if ACTION_LOG_PATH.exists() and ACTION_LOG_PATH.stat().st_size > 128_000:
+            ACTION_LOG_PATH.write_text("", encoding="utf-8")
+        with ACTION_LOG_PATH.open("a", encoding="utf-8") as stream:
+            stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {message}\n")
+    except OSError:
+        pass
 
 
 def load_config() -> dict:
@@ -338,18 +352,69 @@ def verify_launch(pid: int) -> None:
         LAST_LAUNCH["message"] = "Warning: an EAC component became active"
 
 
-def select_exe() -> str:
+def store_selected_exe(selected: str) -> dict:
+    if not selected:
+        return {"cancelled": True}
+
+    path = Path(selected)
+    valid, reason = validate_game(path)
+    if not valid:
+        return {"err": reason}
+
     cfg = load_config()
-    current = Path(cfg.get("game_exe") or "")
-    initial = current.parent if current.parent.is_dir() else Path.home()
-    selected = win_file_dialog(str(initial))
-    if selected:
-        cfg["game_exe"] = selected
-        save_config(cfg)
-    return selected
+    cfg["game_exe"] = str(path)
+    save_config(cfg)
+    return {"ok": "Hero_Siege.exe selected", "path": str(path)}
 
 
-def win_file_dialog(initial_dir: str) -> str:
+def initial_game_directory() -> Path:
+    current = Path(load_config().get("game_exe") or "")
+    return current.parent if current.parent.is_dir() else Path.home()
+
+
+def select_exe_fallback() -> dict:
+    """Open the Win32 picker when the UI is running in a normal browser."""
+    try:
+        return store_selected_exe(win_file_dialog(str(initial_game_directory())))
+    except OSError as exc:
+        return {"err": str(exc)}
+
+
+class LauncherApi:
+    """Native pywebview operations that must be owned by the app window."""
+
+    def select_exe(self) -> dict:
+        log_action("Browse clicked")
+        try:
+            selected = win_file_dialog(
+                str(initial_game_directory()),
+                owner_hwnd=current_window_handle(),
+            )
+        except Exception as exc:
+            log_action(f"Browse failed: {type(exc).__name__}: {exc}")
+            return {"err": f"The file picker could not be opened: {exc}"}
+        result = store_selected_exe(selected)
+        log_action("Browse cancelled" if result.get("cancelled") else f"Browse result: {result}")
+        return result
+
+
+def current_window_handle() -> int:
+    window = WEBVIEW_WINDOW
+    native = getattr(window, "native", None) if window is not None else None
+    if native is None and window is not None:
+        browser_view = getattr(getattr(window, "gui", None), "BrowserView", None)
+        instances = getattr(browser_view, "instances", {})
+        native = instances.get(window.uid)
+    handle = getattr(native, "Handle", None)
+    if handle is None:
+        return 0
+    try:
+        return int(handle.ToInt64())
+    except AttributeError:
+        return int(handle)
+
+
+def win_file_dialog(initial_dir: str, owner_hwnd: int = 0) -> str:
     class OPENFILENAMEW(ctypes.Structure):
         _fields_ = [
             ("lStructSize", wintypes.DWORD), ("hwndOwner", wintypes.HWND),
@@ -369,14 +434,21 @@ def win_file_dialog(initial_dir: str) -> str:
     buffer = ctypes.create_unicode_buffer(32768)
     dialog = OPENFILENAMEW()
     dialog.lStructSize = ctypes.sizeof(dialog)
+    dialog.hwndOwner = owner_hwnd
     dialog.lpstrFilter = "Hero_Siege.exe\0Hero_Siege.exe\0Executable files (*.exe)\0*.exe\0\0"
-    dialog.lpstrFile = buffer
+    dialog.lpstrFile = ctypes.cast(buffer, wintypes.LPWSTR)
     dialog.nMaxFile = len(buffer)
     dialog.lpstrInitialDir = initial_dir
     dialog.lpstrTitle = "Select the clean Steam Hero_Siege.exe"
     dialog.Flags = 0x00001000 | 0x00000800 | 0x00080000
     dialog.lpstrDefExt = "exe"
-    return buffer.value if ctypes.windll.comdlg32.GetOpenFileNameW(ctypes.byref(dialog)) else ""
+    comdlg32 = ctypes.windll.comdlg32
+    if comdlg32.GetOpenFileNameW(ctypes.byref(dialog)):
+        return buffer.value
+    error_code = int(comdlg32.CommDlgExtendedError())
+    if error_code:
+        raise OSError(f"The Windows file picker failed (error 0x{error_code:04X})")
+    return ""
 
 
 def open_game_folder() -> dict:
@@ -386,7 +458,10 @@ def open_game_folder() -> dict:
         target = Path(target).parent
     if not target or not Path(target).is_dir():
         return {"err": "Game folder was not found"}
-    subprocess.Popen(["explorer.exe", str(target)])
+    try:
+        subprocess.Popen(["explorer.exe", str(target)])
+    except OSError as exc:
+        return {"err": f"Game folder could not be opened: {exc}"}
     return {"ok": "Game folder opened"}
 
 
@@ -413,7 +488,7 @@ async function api(path,method='GET'){const r=await fetch(path,{method});return 
 function state(el,good,text){el.className=good===true?'good':good===false?'bad':'warn';el.innerHTML='<i class="dot"></i>'+text}
 async function refresh(){try{const s=await api('/api/status');$('path').textContent=s.game.path||'Not selected';$('build').textContent=s.game.build;state($('steam'),s.steamRunning,s.steamRunning?'Running':(s.steamFound?'Ready':'Not found'));state($('eac'),s.safe,s.safe?'Inactive':'ACTIVE');state($('game'),s.gameRunning,s.gameRunning?'Running':'Closed');const ready=s.game.valid&&s.safe&&!s.gameRunning;$('launch').disabled=busy||!ready;$('overall').textContent=s.gameRunning&&s.safe?'PLAYING OFFLINE':ready?'READY':s.gameRunning?'CHECK':'SETUP NEEDED';$('activity').innerHTML='<strong>'+s.lastLaunch.message+'</strong>'}catch(e){$('activity').textContent='Status error: '+e}}
 async function launchGame(){busy=true;$('launch').disabled=true;$('activity').innerHTML='<strong>Launching…</strong> Waiting for the clean game process.';const r=await api('/api/launch','POST');busy=false;$('activity').innerHTML=r.err?'<strong class="bad">'+r.err+'</strong>':'<strong class="good">'+r.ok+'</strong>';refresh()}
-async function browse(){await api('/api/select','POST');refresh()}async function folder(){await api('/api/folder','POST')}
+async function browse(){if(busy)return;busy=true;$('launch').disabled=true;$('activity').innerHTML='<strong>Opening the game picker…</strong>';try{let r;if(window.pywebview&&window.pywebview.api){r=await window.pywebview.api.select_exe()}else{r=await api('/api/select','POST')}if(r.err){$('activity').innerHTML='<strong class="bad">'+r.err+'</strong>'}else if(r.cancelled){$('activity').innerHTML='<strong>Selection cancelled.</strong>'}else{$('activity').innerHTML='<strong class="good">'+r.ok+'</strong>'}}catch(e){$('activity').innerHTML='<strong class="bad">Browse failed: '+e+'</strong>'}finally{busy=false;await refresh()}}async function folder(){const r=await api('/api/folder','POST');if(r.err)$('activity').innerHTML='<strong class="bad">'+r.err+'</strong>'}
 refresh();setInterval(refresh,2000);
 </script></body></html>"""
 
@@ -424,11 +499,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def json_response(self, value: dict, status: int = 200) -> None:
         payload = json.dumps(value).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The WebView can close while its final status refresh is in flight.
+            pass
 
     def do_GET(self):
         route = urlparse(self.path).path
@@ -450,50 +531,95 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/launch":
             self.json_response(launch_game())
         elif route == "/api/select":
-            selected = select_exe()
-            self.json_response({"ok": "Selected", "path": selected})
+            self.json_response(select_exe_fallback())
         elif route == "/api/folder":
             self.json_response(open_game_folder())
         else:
             self.send_error(404)
 
 
-def start_server() -> tuple[ThreadingHTTPServer, int]:
+class LauncherServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    block_on_close = False
+
+
+def start_server() -> tuple[LauncherServer, int, threading.Thread]:
     for port in PORTS:
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-            threading.Thread(target=server.serve_forever, daemon=True).start()
-            return server, port
+            server = LauncherServer(("127.0.0.1", port), Handler)
+            thread = threading.Thread(target=server.serve_forever, name="launcher-http", daemon=True)
+            thread.start()
+            return server, port, thread
         except OSError:
             continue
     raise RuntimeError("No local launcher port is available")
 
 
+def stop_server() -> None:
+    global SERVER, SERVER_THREAD
+    server = SERVER
+    thread = SERVER_THREAD
+    SERVER = None
+    SERVER_THREAD = None
+    if server is None:
+        return
+    try:
+        server.shutdown()
+    except OSError:
+        pass
+    finally:
+        server.server_close()
+    if thread and thread is not threading.current_thread():
+        thread.join(timeout=2)
+
+
 def main() -> int:
-    global SERVER, WEBVIEW_WINDOW
+    global SERVER, SERVER_THREAD, WEBVIEW_WINDOW
     if os.name != "nt":
         print("HS Offline Launcher currently supports Windows only.", file=sys.stderr)
         return 1
     ensure_state_dir()
     load_config()
-    SERVER, port = start_server()
+    SERVER, port, SERVER_THREAD = start_server()
     url = f"http://127.0.0.1:{port}/"
+    exit_code = 0
     try:
-        import webview
-
-        WEBVIEW_WINDOW = webview.create_window(APP_NAME, url, width=960, height=670, min_size=(760, 600), background_color="#070b12")
-        webview.start(debug=False)
-    except Exception:
-        webbrowser.open(url)
         try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
+            import webview
+        except ImportError:
+            webbrowser.open(url)
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
+        else:
+            try:
+                WEBVIEW_WINDOW = webview.create_window(
+                    APP_NAME,
+                    url,
+                    js_api=LauncherApi(),
+                    width=960,
+                    height=670,
+                    min_size=(760, 600),
+                    background_color="#070b12",
+                )
+                webview.start(debug=False)
+            except Exception as exc:
+                # Do not reopen the app in a browser after its native window closes.
+                # Keep a small diagnostic for reports from machines with a broken WebView runtime.
+                ensure_state_dir()
+                (STATE_DIR / "launcher-error.log").write_text(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')}\n{type(exc).__name__}: {exc}\n",
+                    encoding="utf-8",
+                )
+                exit_code = 1
+            finally:
+                WEBVIEW_WINDOW = None
     finally:
-        if SERVER:
-            SERVER.shutdown()
-    return 0
+        stop_server()
+    return exit_code
 
 
 if __name__ == "__main__":

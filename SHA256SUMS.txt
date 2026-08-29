@@ -1,1 +1,1 @@
-1060319fc56183b71de41459cb27b83e0e5b5377ad96a81c6235689120960500  HS-Offline-Launcher.exe
+4cff21adc93336b2ff25f6ba3203606b0b38bdd266b2d8c5b9ec8cccd7fe9468  HS-Offline-Launcher.exe
