@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """HS Offline Launcher.
 
-Starts the clean Steam Hero_Siege.exe directly with Steam's public AppID in
-the child environment.  It does not patch game files, stop services, install
-DLLs, or load any gameplay tool.  Tool integration deliberately lives outside
-this first-stage launcher.
+Starts the selected Steam Hero_Siege.exe directly with Steam's public AppID in
+the child environment.  It does not patch game files, stop services, or install
+DLLs. Existing offline mod-loader builds are identified and may be launched,
+but the launcher itself never modifies them.
 """
 
 from __future__ import annotations
 
 import ctypes
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
@@ -33,14 +35,33 @@ CONFIG_PATH = STATE_DIR / "config.json"
 ACTION_LOG_PATH = STATE_DIR / "launcher.log"
 
 KNOWN_BUILDS = {
+    "438bf4848688c5be52ac15f26f02b46da620d90587c28e766a9cea190f3a7de4": "Season 10 · 2026.08.30",
     "0766aa8bfc6eb5679df46f78546644e34fae333adc22474f96903c1d68f251f5": "Season 10 · 2026.08.24",
     "ba72b95ac10785d0ecdcc2b3d1925d6cb3439efaf4cef9de2ea1f67d6cfdd4df": "Season 10 · 2026.08.22 legacy",
 }
+
+STEAM_RUNTIME_NAME = "steam_api64.dll"
+PE_MACHINE_AMD64 = 0x8664
+MAX_PE_OFFSET = 16 * 1024 * 1024
+INACTIVE_EAC_STATES = frozenset({"stopped", "not-installed"})
+EAC_PROCESS_NAMES = frozenset({
+    "easyanticheat.exe",
+    "easyanticheat_eos.exe",
+    "easyanticheat_eossys.exe",
+    "start_protected_game.exe",
+})
+
+WINDOWS_DIR = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+SC_EXE = WINDOWS_DIR / "System32" / "sc.exe"
+EXPLORER_EXE = WINDOWS_DIR / "explorer.exe"
+API_HEADER = "X-HS-Launcher-Token"
+API_TOKEN = secrets.token_urlsafe(32)
 
 CREATE_NO_WINDOW = 0x08000000
 WEBVIEW_WINDOW = None
 SERVER = None
 SERVER_THREAD = None
+LAUNCH_LOCK = threading.Lock()
 LAST_LAUNCH = {"pid": 0, "time": "", "message": "Ready"}
 HASH_CACHE: dict[tuple[str, int, int], str] = {}
 
@@ -71,7 +92,8 @@ def load_config() -> dict:
                 cfg.update(saved)
         except (OSError, ValueError, TypeError):
             pass
-    if not cfg.get("game_exe"):
+    configured = configured_game_path(cfg)
+    if configured is None or not configured.is_file():
         found = discover_game_exe()
         if found:
             cfg["game_exe"] = str(found)
@@ -84,6 +106,14 @@ def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
+def configured_game_path(cfg: dict) -> Path | None:
+    raw = cfg.get("game_exe")
+    if not isinstance(raw, (str, os.PathLike)):
+        return None
+    value = os.path.expandvars(os.path.expanduser(str(raw).strip().strip('"')))
+    return Path(value) if value else None
+
+
 def registry_steam_roots() -> list[Path]:
     roots: list[Path] = []
     try:
@@ -91,6 +121,7 @@ def registry_steam_roots() -> list[Path]:
 
         for hive, key_name in (
             (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Valve\Steam"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
         ):
             try:
@@ -127,7 +158,14 @@ def steam_libraries() -> list[Path]:
         vdf = root / "steamapps" / "libraryfolders.vdf"
         try:
             text = vdf.read_text(encoding="utf-8", errors="ignore")
-            for raw in re.findall(r'"path"\s+"([^"]+)"', text, flags=re.IGNORECASE):
+            modern = re.findall(r'"path"\s+"([^"]+)"', text, flags=re.IGNORECASE)
+            # Numeric key/value entries are an old libraryfolders.vdf format.
+            # Do not parse them in the modern format, where app IDs are also
+            # numeric key/value pairs and are not library paths.
+            legacy = [] if modern else re.findall(
+                r'^\s*"\d+"\s+"([^"]+)"', text, flags=re.IGNORECASE | re.MULTILINE
+            )
+            for raw in modern + legacy:
                 libraries.append(Path(raw.replace(r"\\", "\\")))
         except OSError:
             continue
@@ -135,11 +173,24 @@ def steam_libraries() -> list[Path]:
 
 
 def discover_game_exe() -> Path | None:
+    candidates: list[Path] = []
     for library in steam_libraries():
-        candidate = library / "steamapps" / "common" / "HeroSiege" / "bin" / "Hero_Siege.exe"
-        if candidate.is_file():
-            return candidate
-    return None
+        steamapps = library / "steamapps"
+        manifest = steamapps / f"appmanifest_{APP_ID}.acf"
+        try:
+            text = manifest.read_text(encoding="utf-8", errors="ignore")
+            match = re.search(r'"installdir"\s+"([^"]+)"', text, flags=re.IGNORECASE)
+            if match:
+                install_dir = match.group(1).replace(r"\\", "\\")
+                candidates.append(steamapps / "common" / install_dir / "bin" / "Hero_Siege.exe")
+        except OSError:
+            pass
+        candidates.append(steamapps / "common" / "HeroSiege" / "bin" / "Hero_Siege.exe")
+
+    existing = [candidate for candidate in unique_paths(candidates) if candidate.is_file()]
+    if not existing:
+        return None
+    return next((candidate for candidate in existing if find_steam_runtime(candidate)), existing[0])
 
 
 def steam_exe() -> Path | None:
@@ -169,15 +220,25 @@ def processes() -> list[tuple[int, str]]:
     if os.name != "nt":
         return []
     kernel32 = ctypes.windll.kernel32
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
     snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
-    invalid_handle = ctypes.c_void_p(-1).value
-    if snapshot == invalid_handle:
-        return []
+    invalid_handle = wintypes.HANDLE(-1).value
+    if snapshot in (None, invalid_handle):
+        raise OSError("Windows process snapshot could not be created")
     rows: list[tuple[int, str]] = []
     entry = PROCESSENTRY32W()
     entry.dwSize = ctypes.sizeof(entry)
     try:
         ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        if not ok:
+            raise OSError("Windows process snapshot could not be read")
         while ok:
             rows.append((int(entry.th32ProcessID), entry.szExeFile))
             ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
@@ -194,27 +255,31 @@ def matching_processes(*names: str) -> list[tuple[int, str]]:
 def eac_service_status() -> str:
     try:
         completed = subprocess.run(
-            ["sc.exe", "query", "EasyAntiCheat_EOS"],
+            [str(SC_EXE), "query", "EasyAntiCheat_EOS"],
             capture_output=True,
             text=True,
             timeout=3,
             creationflags=CREATE_NO_WINDOW,
         )
-        match = re.search(r":\s*(\d+)\s+([A-Z_]+)", completed.stdout, flags=re.IGNORECASE)
+        match = re.search(r"^\s*STATE\s*:\s*(\d+)\b", completed.stdout, flags=re.IGNORECASE | re.MULTILINE)
         if match:
-            return "running" if match.group(1) == "4" else "stopped"
-        return "not-installed" if completed.returncode else "unknown"
+            state = int(match.group(1))
+            if state == 1:
+                return "stopped"
+            if state == 4:
+                return "running"
+            return "transitioning"
+        return "not-installed" if completed.returncode == 1060 else "unknown"
     except (OSError, subprocess.SubprocessError):
         return "unknown"
 
 
+def eac_is_inactive(status: str) -> bool:
+    return status in INACTIVE_EAC_STATES
+
+
 def eac_processes() -> list[tuple[int, str]]:
-    return matching_processes(
-        "EasyAntiCheat.exe",
-        "EasyAntiCheat_EOS.exe",
-        "EasyAntiCheat_EOSSys.exe",
-        "start_protected_game.exe",
-    )
+    return [(pid, name) for pid, name in processes() if name.lower() in EAC_PROCESS_NAMES]
 
 
 def file_sha256(path: Path) -> str:
@@ -232,71 +297,175 @@ def file_sha256(path: Path) -> str:
     return value
 
 
-def validate_game(path: Path) -> tuple[bool, str]:
-    if not path.is_file():
+def pe_section_names(path: Path) -> set[str]:
+    """Read enough PE metadata to identify a real 64-bit Windows executable."""
+    size = path.stat().st_size
+    with path.open("rb") as stream:
+        dos_header = stream.read(64)
+        if len(dos_header) != 64 or dos_header[:2] != b"MZ":
+            raise ValueError("missing DOS header")
+        pe_offset = int.from_bytes(dos_header[0x3C:0x40], "little")
+        if pe_offset < 64 or pe_offset > MAX_PE_OFFSET or pe_offset + 24 > size:
+            raise ValueError("invalid PE header offset")
+        stream.seek(pe_offset)
+        pe_header = stream.read(24)
+        if len(pe_header) != 24 or pe_header[:4] != b"PE\0\0":
+            raise ValueError("missing PE signature")
+        machine = int.from_bytes(pe_header[4:6], "little")
+        if machine != PE_MACHINE_AMD64:
+            raise ValueError("the executable is not 64-bit")
+        section_count = int.from_bytes(pe_header[6:8], "little")
+        optional_header_size = int.from_bytes(pe_header[20:22], "little")
+        characteristics = int.from_bytes(pe_header[22:24], "little")
+        if not 1 <= section_count <= 96:
+            raise ValueError("invalid PE section count")
+        if characteristics & 0x0002 == 0:
+            raise ValueError("PE image is not executable")
+        if optional_header_size < 2:
+            raise ValueError("missing PE optional header")
+        stream.seek(pe_offset + 24)
+        if int.from_bytes(stream.read(2), "little") != 0x020B:
+            raise ValueError("the executable is not PE32+")
+        section_table = pe_offset + 24 + optional_header_size
+        if section_table + section_count * 40 > size:
+            raise ValueError("truncated PE section table")
+        stream.seek(section_table)
+        result: set[str] = set()
+        has_file_data = False
+        for _ in range(section_count):
+            section = stream.read(40)
+            name = section[:8].split(b"\0", 1)[0].decode("ascii", errors="ignore").lower()
+            if name:
+                result.add(name)
+            raw_size = int.from_bytes(section[16:20], "little")
+            raw_offset = int.from_bytes(section[20:24], "little")
+            if raw_size and raw_offset and raw_offset + raw_size <= size:
+                has_file_data = True
+        if not has_file_data:
+            raise ValueError("PE sections contain no file data")
+        return result
+
+
+def find_steam_runtime(path: Path) -> Path | None:
+    """Support both current bin-local and older game-root Steam layouts."""
+    for directory in unique_paths([path.parent, path.parent.parent]):
+        candidate = directory / STEAM_RUNTIME_NAME
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def validate_game(path: Path | None) -> tuple[bool, str]:
+    if path is None or not path.is_file():
         return False, "Hero_Siege.exe was not found"
     if path.name.lower() != "hero_siege.exe":
         return False, "Select the clean Hero_Siege.exe, not a modded or protected launcher"
     try:
-        if path.stat().st_size < 50_000_000 or path.open("rb").read(2) != b"MZ":
-            return False, "The selected file is not a valid Hero Siege Windows executable"
-        if b".aurie" in path.open("rb").read(4096):
-            return False, "The selected executable contains an Aurie patch; select the clean Steam EXE"
+        sections = pe_section_names(path)
+    except ValueError as exc:
+        return False, f"The selected file is not a valid Hero Siege Windows executable ({exc})"
     except OSError as exc:
         return False, f"The executable could not be read: {exc}"
-    if not (path.parent / "steam_api64.dll").is_file():
-        return False, "Steam runtime was not found beside the selected EXE"
+    if not find_steam_runtime(path):
+        return False, "steam_api64.dll is missing. Verify Hero Siege files in Steam, then try again."
+    if ".aurie" in sections:
+        return True, "Compatible Aurie/ForgePact build — offline use only"
     return True, "Clean Steam executable"
 
 
-def game_details(path: Path) -> dict:
+def game_details(path: Path | None) -> dict:
     valid, reason = validate_game(path)
+    exists = bool(path and path.is_file())
+    modified = False
+    if valid and path:
+        try:
+            modified = ".aurie" in pe_section_names(path)
+        except (OSError, ValueError):
+            pass
     result = {
-        "path": str(path),
-        "exists": path.is_file(),
+        "path": str(path) if path else "",
+        "exists": exists,
         "valid": valid,
         "validation": reason,
-        "size": path.stat().st_size if path.is_file() else 0,
+        "size": path.stat().st_size if exists and path else 0,
         "hash": "",
-        "build": "Not selected",
+        "build": "Checking…" if valid else ("Game not found" if not exists else "Invalid selection"),
         "known": False,
+        "modified": modified,
     }
-    if valid:
+    if valid and path:
         try:
             digest = file_sha256(path)
-            result.update(hash=digest, build=KNOWN_BUILDS.get(digest, "New/unknown Steam build"), known=digest in KNOWN_BUILDS)
+            if modified:
+                label = "Modified/custom Hero Siege build"
+            else:
+                label = KNOWN_BUILDS.get(digest, "New/unknown Steam build")
+            result.update(hash=digest, build=label, known=digest in KNOWN_BUILDS)
         except OSError as exc:
-            result.update(validation=f"Hash check failed: {exc}")
+            result.update(build="Hash unavailable", validation=f"Executable is valid; hash check failed: {exc}")
     return result
 
 
 def current_status() -> dict:
     cfg = load_config()
-    path = Path(cfg.get("game_exe") or "")
-    rows = processes()
+    path = configured_game_path(cfg)
+    try:
+        rows = processes()
+        process_scan_ok = True
+    except OSError:
+        rows = []
+        process_scan_ok = False
     names = {name.lower() for _, name in rows}
     game_rows = [(pid, name) for pid, name in rows if name.lower() == "hero_siege.exe"]
-    eac_rows = [(pid, name) for pid, name in rows if name.lower() in {
-        "easyanticheat.exe", "easyanticheat_eos.exe", "easyanticheat_eossys.exe", "start_protected_game.exe"
-    }]
+    eac_rows = [(pid, name) for pid, name in rows if name.lower() in EAC_PROCESS_NAMES]
     service = eac_service_status()
+    game = game_details(path)
+    steam_running = "steam.exe" in names
+    steam_found = bool(steam_exe())
+    safe = process_scan_ok and eac_is_inactive(service) and not eac_rows
+    game_running = bool(game_rows)
+    ready = game["valid"] and safe and not game_running and (steam_running or steam_found)
+    if game_running and not safe:
+        blocker = "Warning: Hero Siege and EAC are active. Close the protected game/session."
+    elif game_running:
+        blocker = "Hero Siege is already running"
+    elif not game["valid"]:
+        blocker = game["validation"]
+    elif not process_scan_ok:
+        blocker = "Running processes could not be verified. Reopen the launcher and try again."
+    elif service == "unknown":
+        blocker = "EAC status could not be verified. Reopen the launcher or check the Easy Anti-Cheat service."
+    elif service == "transitioning":
+        blocker = "EAC is changing state. Wait a moment, then try again."
+    elif not safe:
+        blocker = "EAC is active. Close the protected game/session before launching offline."
+    elif not steam_running and not steam_found:
+        blocker = "Steam was not found. Install or open Steam, then try again."
+    else:
+        blocker = ""
     return {
         "appId": APP_ID,
-        "game": game_details(path),
-        "steamRunning": "steam.exe" in names,
-        "steamFound": bool(steam_exe()),
-        "gameRunning": bool(game_rows),
+        "game": game,
+        "steamRunning": steam_running,
+        "steamFound": steam_found,
+        "gameRunning": game_running,
         "gamePid": game_rows[0][0] if game_rows else 0,
         "eacService": service,
         "eacProcesses": [{"pid": pid, "name": name} for pid, name in eac_rows],
-        "safe": service != "running" and not eac_rows,
+        "processScanOk": process_scan_ok,
+        "safe": safe,
+        "ready": ready,
+        "blocker": blocker,
         "lastLaunch": dict(LAST_LAUNCH),
     }
 
 
 def start_steam_if_needed() -> tuple[bool, str]:
-    if matching_processes("steam.exe"):
-        return True, "Steam is running"
+    try:
+        if matching_processes("steam.exe"):
+            return True, "Steam is running"
+    except OSError:
+        return False, "Running processes could not be verified"
     exe = steam_exe()
     if not exe:
         return False, "Steam was not found"
@@ -306,29 +475,73 @@ def start_steam_if_needed() -> tuple[bool, str]:
         return False, f"Steam could not be started: {exc}"
     for _ in range(20):
         time.sleep(0.5)
-        if matching_processes("steam.exe"):
-            return True, "Steam started"
+        try:
+            if matching_processes("steam.exe"):
+                return True, "Steam started"
+        except OSError:
+            return False, "Running processes could not be verified"
     return False, "Steam did not become ready"
 
 
 def launch_game() -> dict:
+    if not LAUNCH_LOCK.acquire(blocking=False):
+        return {"err": "A launch request is already in progress"}
+    try:
+        return launch_game_locked()
+    finally:
+        LAUNCH_LOCK.release()
+
+
+def launch_safety_blocker() -> str:
+    try:
+        rows = processes()
+    except OSError:
+        return "Running processes could not be verified, so launch was blocked"
+    if any(name.lower() == "hero_siege.exe" for _, name in rows):
+        return "Hero Siege is already running"
+
+    service = eac_service_status()
+    active_eac = [(pid, name) for pid, name in rows if name.lower() in EAC_PROCESS_NAMES]
+    if eac_is_inactive(service) and not active_eac:
+        return ""
+    if service == "unknown":
+        return "EAC status could not be verified, so launch was blocked"
+    if service == "transitioning":
+        return "EAC is changing state. Wait a moment, then try again"
+    return (
+        "EAC is currently active. Close the protected game/session first; "
+        "this launcher will not stop or modify EAC."
+    )
+
+
+def launch_game_locked() -> dict:
     cfg = load_config()
-    path = Path(cfg.get("game_exe") or "")
+    path = configured_game_path(cfg)
     valid, reason = validate_game(path)
     if not valid:
         return {"err": reason}
-    if matching_processes("Hero_Siege.exe"):
-        return {"err": "Hero Siege is already running"}
-    if eac_service_status() == "running" or eac_processes():
-        return {"err": "EAC is currently active. Close the protected game/session first; this launcher will not stop or modify EAC."}
+    assert path is not None
+    blocker = launch_safety_blocker()
+    if blocker:
+        return {"err": blocker}
 
     steam_ok, steam_message = start_steam_if_needed()
     if not steam_ok:
         return {"err": steam_message}
 
+    # Steam startup can take several seconds. Protection or another game
+    # instance may appear during that wait, so fail closed again immediately
+    # before creating the game process.
+    blocker = launch_safety_blocker()
+    if blocker:
+        return {"err": blocker}
+
     child_env = os.environ.copy()
     child_env["SteamAppId"] = APP_ID
     child_env["SteamGameId"] = APP_ID
+    runtime = find_steam_runtime(path)
+    if runtime and runtime.parent != path.parent:
+        child_env["PATH"] = str(runtime.parent) + os.pathsep + child_env.get("PATH", "")
     try:
         process = subprocess.Popen([str(path)], cwd=str(path.parent), env=child_env)
     except OSError as exc:
@@ -341,10 +554,15 @@ def launch_game() -> dict:
 
 def verify_launch(pid: int) -> None:
     time.sleep(5)
-    running = any(row_pid == pid for row_pid, _ in matching_processes("Hero_Siege.exe"))
+    try:
+        rows = processes()
+    except OSError:
+        LAST_LAUNCH["message"] = "Warning: running processes could not be verified"
+        return
+    running = any(row_pid == pid and name.lower() == "hero_siege.exe" for row_pid, name in rows)
     service = eac_service_status()
-    protected = eac_processes()
-    if running and service != "running" and not protected:
+    protected = [(row_pid, name) for row_pid, name in rows if name.lower() in EAC_PROCESS_NAMES]
+    if running and eac_is_inactive(service) and not protected:
         LAST_LAUNCH["message"] = "Verified: game running, EAC inactive"
     elif not running:
         LAST_LAUNCH["message"] = "The game exited during startup"
@@ -368,8 +586,8 @@ def store_selected_exe(selected: str) -> dict:
 
 
 def initial_game_directory() -> Path:
-    current = Path(load_config().get("game_exe") or "")
-    return current.parent if current.parent.is_dir() else Path.home()
+    current = configured_game_path(load_config())
+    return current.parent if current and current.parent.is_dir() else Path.home()
 
 
 def select_exe_fallback() -> dict:
@@ -452,14 +670,19 @@ def win_file_dialog(initial_dir: str, owner_hwnd: int = 0) -> str:
 
 
 def open_game_folder() -> dict:
-    path = Path(load_config().get("game_exe") or "")
-    target = path.parent if path.parent.is_dir() else discover_game_exe()
-    if target and Path(target).is_file():
-        target = Path(target).parent
-    if not target or not Path(target).is_dir():
+    path = configured_game_path(load_config())
+    if path is None or not validate_game(path)[0]:
+        path = discover_game_exe()
+    if path is None or not validate_game(path)[0]:
         return {"err": "Game folder was not found"}
+    if str(path).startswith((r"\\", "//")):
+        return {"err": "Network game folders are not supported"}
     try:
-        subprocess.Popen(["explorer.exe", str(target)])
+        target = path.resolve(strict=True).parent
+    except OSError as exc:
+        return {"err": f"Game folder could not be resolved: {exc}"}
+    try:
+        subprocess.Popen([str(EXPLORER_EXE), str(target)])
     except OSError as exc:
         return {"err": f"Game folder could not be opened: {exc}"}
     return {"ok": "Game folder opened"}
@@ -472,23 +695,25 @@ HTML = r"""<!doctype html>
 :root{--bg:#070b12;--panel:#0e1622;--panel2:#121d2b;--line:#26374a;--text:#edf4fb;--muted:#8494a8;--cyan:#35c4ee;--mint:#55e0b2;--amber:#f4bd5e;--red:#ff6576}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 82% 0,#142438 0,transparent 35%),linear-gradient(145deg,#070b12,#0a111b 60%,#070b12);color:var(--text);font:14px/1.45 "Segoe UI",sans-serif;min-height:100vh;overflow:hidden}
 .shell{height:100vh}.main{max-width:940px;margin:0 auto;padding:34px 38px;overflow:auto}.top{display:flex;align-items:center;justify-content:space-between}.brand{font-size:22px;font-weight:800;letter-spacing:.3px}.brand b{color:var(--cyan)}.title{font-size:29px;font-weight:800;margin:24px 0 3px}.desc{color:var(--muted)}
-.badge{border:1px solid #245d50;background:#102721;color:var(--mint);border-radius:30px;padding:10px 15px;font-weight:700;font-size:12px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:28px 0 18px}.stat{background:rgba(15,24,36,.9);border:1px solid var(--line);border-radius:12px;padding:16px}.stat small{display:block;color:var(--muted);margin-bottom:8px}.stat strong{font-size:15px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;background:var(--amber);box-shadow:0 0 12px currentColor}.good{color:var(--mint)}.bad{color:var(--red)}.warn{color:var(--amber)}
+.badge{border:1px solid #5d5124;background:#272310;color:var(--amber);border-radius:30px;padding:10px 15px;font-weight:700;font-size:12px}.badge.good{border-color:#245d50;background:#102721}.badge.bad{border-color:#71313b;background:#29151a}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:28px 0 18px}.stat{background:rgba(15,24,36,.9);border:1px solid var(--line);border-radius:12px;padding:16px}.stat small{display:block;color:var(--muted);margin-bottom:8px}.stat strong{font-size:15px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;background:var(--amber);box-shadow:0 0 12px currentColor}.good{color:var(--mint)}.bad{color:var(--red)}.warn{color:var(--amber)}
 .card{background:linear-gradient(145deg,rgba(18,29,43,.96),rgba(12,20,31,.96));border:1px solid var(--line);border-radius:16px;padding:22px;margin-top:14px;box-shadow:0 18px 50px rgba(0,0,0,.2)}.card h2{font-size:16px;margin:0 0 16px}.pathrow{display:grid;grid-template-columns:1fr auto auto;gap:10px}.path{background:#080d15;border:1px solid #26394c;border-radius:9px;padding:13px 14px;color:#b8c7d6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:Consolas,monospace;font-size:12px}
 button{border:0;border-radius:9px;padding:0 16px;font-weight:700;color:#dce8f2;background:#1b2a3b;cursor:pointer;transition:.18s}button:hover{transform:translateY(-1px);filter:brightness(1.15)}button:disabled{opacity:.45;cursor:not-allowed;transform:none}.launch{width:100%;height:64px;margin-top:16px;background:linear-gradient(100deg,#168fb7,#26c2dc);color:#031018;font-size:17px;box-shadow:0 10px 28px rgba(36,190,222,.18)}
-.buildline{margin-top:12px;color:var(--muted);font-size:12px}.buildline strong{color:#b9c9d8}.activity{color:#91a5ba;min-height:74px}.activity strong{color:#dbe9f6}
+.buildline{margin-top:12px;color:var(--muted);font-size:12px}.buildline strong{color:#b9c9d8}.validation{margin-top:7px;min-height:20px;font-size:12px}.activity{color:#91a5ba;min-height:74px}.activity strong{color:#dbe9f6}
 @media(max-width:760px){.main{padding:24px}.grid{grid-template-columns:1fr}.pathrow{grid-template-columns:1fr 1fr}.path{grid-column:1/-1}}
 </style></head>
 <body><div class="shell"><main class="main"><div class="top"><div class="brand"><b>HS</b> OFFLINE LAUNCHER</div><div class="badge" id="overall">CHECKING</div></div><div class="title">Play Hero Siege Offline</div><div class="desc">Select the game and press Launch.</div>
 <div class="grid" style="grid-template-columns:repeat(3,1fr)"><div class="stat"><small>STEAM</small><strong id="steam"><i class="dot"></i>Checking</strong></div><div class="stat"><small>PROTECTION</small><strong id="eac"><i class="dot"></i>Checking</strong></div><div class="stat"><small>GAME</small><strong id="game"><i class="dot"></i>Checking</strong></div></div>
-<section class="card"><h2>Game Location</h2><div class="pathrow"><div class="path" id="path">Detecting game…</div><button onclick="browse()">Browse</button><button onclick="folder()">Folder</button></div><div class="buildline">Build: <strong id="build">—</strong></div><button class="launch" id="launch" onclick="launchGame()">▶ LAUNCH OFFLINE</button></section>
+<section class="card"><h2>Game Location</h2><div class="pathrow"><div class="path" id="path">Detecting game…</div><button onclick="browse()">Browse</button><button onclick="folder()">Folder</button></div><div class="buildline">Build: <strong id="build">—</strong></div><div class="validation warn" id="validation">Checking the selected executable…</div><button class="launch" id="launch" onclick="launchGame()">▶ LAUNCH OFFLINE</button></section>
 <section class="card activity"><h2>Status</h2><div id="activity"><strong>Ready.</strong></div></section></main></div>
 <script>
-const $=id=>document.getElementById(id);let busy=false;
-async function api(path,method='GET'){const r=await fetch(path,{method});return r.json()}
+const $=id=>document.getElementById(id);const API_TOKEN='__HS_API_TOKEN__';let busy=false;let activityPinnedUntil=0;
+async function api(path,method='GET'){const headers={'X-HS-Launcher-Token':API_TOKEN};if(method!=='GET')headers['Content-Type']='application/json';const r=await fetch(path,{method,headers});const body=await r.json();if(!r.ok)throw new Error(body.err||('HTTP '+r.status));return body}
 function state(el,good,text){el.className=good===true?'good':good===false?'bad':'warn';el.innerHTML='<i class="dot"></i>'+text}
-async function refresh(){try{const s=await api('/api/status');$('path').textContent=s.game.path||'Not selected';$('build').textContent=s.game.build;state($('steam'),s.steamRunning,s.steamRunning?'Running':(s.steamFound?'Ready':'Not found'));state($('eac'),s.safe,s.safe?'Inactive':'ACTIVE');state($('game'),s.gameRunning,s.gameRunning?'Running':'Closed');const ready=s.game.valid&&s.safe&&!s.gameRunning;$('launch').disabled=busy||!ready;$('overall').textContent=s.gameRunning&&s.safe?'PLAYING OFFLINE':ready?'READY':s.gameRunning?'CHECK':'SETUP NEEDED';$('activity').innerHTML='<strong>'+s.lastLaunch.message+'</strong>'}catch(e){$('activity').textContent='Status error: '+e}}
-async function launchGame(){busy=true;$('launch').disabled=true;$('activity').innerHTML='<strong>Launching…</strong> Waiting for the clean game process.';const r=await api('/api/launch','POST');busy=false;$('activity').innerHTML=r.err?'<strong class="bad">'+r.err+'</strong>':'<strong class="good">'+r.ok+'</strong>';refresh()}
-async function browse(){if(busy)return;busy=true;$('launch').disabled=true;$('activity').innerHTML='<strong>Opening the game picker…</strong>';try{let r;if(window.pywebview&&window.pywebview.api){r=await window.pywebview.api.select_exe()}else{r=await api('/api/select','POST')}if(r.err){$('activity').innerHTML='<strong class="bad">'+r.err+'</strong>'}else if(r.cancelled){$('activity').innerHTML='<strong>Selection cancelled.</strong>'}else{$('activity').innerHTML='<strong class="good">'+r.ok+'</strong>'}}catch(e){$('activity').innerHTML='<strong class="bad">Browse failed: '+e+'</strong>'}finally{busy=false;await refresh()}}async function folder(){const r=await api('/api/folder','POST');if(r.err)$('activity').innerHTML='<strong class="bad">'+r.err+'</strong>'}
+function activity(text,kind='',holdMs=0){const strong=document.createElement('strong');strong.textContent=text;strong.className=kind;$('activity').replaceChildren(strong);if(holdMs)activityPinnedUntil=Date.now()+holdMs}
+async function refresh(){try{const s=await api('/api/status');$('path').textContent=s.game.path||'Not selected';$('build').textContent=s.game.build;state($('steam'),s.steamRunning,s.steamRunning?'Running':(s.steamFound?'Ready':'Not found'));state($('eac'),s.safe,s.safe?'Inactive':'ACTIVE');state($('game'),s.gameRunning,s.gameRunning?'Running':'Closed');$('launch').disabled=busy||!s.ready;const playing=s.gameRunning&&s.safe;$('overall').textContent=playing?'PLAYING OFFLINE':s.ready?'READY':s.gameRunning?'CHECK':'SETUP NEEDED';$('overall').className='badge '+(playing||s.ready?'good':s.gameRunning?'warn':'bad');$('validation').textContent=playing||s.ready?s.game.validation:s.blocker;$('validation').className='validation '+(playing||s.ready?(s.game.modified?'warn':'good'):'bad');if(!busy&&Date.now()>=activityPinnedUntil){const last=s.lastLaunch.message;const fallback=playing?'Game is running offline; EAC is inactive.':s.ready?'Ready to launch offline.':s.blocker;activity(last&&last!=='Ready'?last:fallback,playing||s.ready?'good':s.gameRunning?'warn':'bad')}}catch(e){activity('Status error: '+e,'bad',6000)}}
+async function launchGame(){busy=true;$('launch').disabled=true;activity('Launching… Waiting for the game process.');try{const r=await api('/api/launch','POST');activity(r.err||r.ok,r.err?'bad':'good',6000)}catch(e){activity('Launch failed: '+e,'bad',6000)}finally{busy=false;await refresh()}}
+async function browse(){if(busy)return;busy=true;$('launch').disabled=true;activity('Opening the game picker…');try{let r;if(window.pywebview&&window.pywebview.api){r=await window.pywebview.api.select_exe()}else{r=await api('/api/select','POST')}if(r.err){activity(r.err,'bad',6000)}else if(r.cancelled){activity('Selection cancelled.','',3000)}else{activity(r.ok,'good',3000)}}catch(e){activity('Browse failed: '+e,'bad',6000)}finally{busy=false;await refresh()}}
+async function folder(){try{const r=await api('/api/folder','POST');if(r.err)activity(r.err,'bad',6000)}catch(e){activity('Folder failed: '+e,'bad',6000)}}
 refresh();setInterval(refresh,2000);
 </script></body></html>"""
 
@@ -497,6 +722,27 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):
         return
 
+    def expected_host(self) -> str:
+        return f"127.0.0.1:{self.server.server_port}"
+
+    def request_host_valid(self) -> bool:
+        return self.headers.get("Host", "").strip().lower() == self.expected_host()
+
+    def request_origin_valid(self) -> bool:
+        origin = self.headers.get("Origin", "").strip().lower()
+        return not origin or origin == f"http://{self.expected_host()}"
+
+    def api_authorized(self) -> bool:
+        supplied = self.headers.get(API_HEADER, "")
+        return (
+            self.request_host_valid()
+            and self.request_origin_valid()
+            and hmac.compare_digest(supplied, API_TOKEN)
+        )
+
+    def reject_request(self) -> None:
+        self.json_response({"err": "Forbidden"}, 403)
+
     def json_response(self, value: dict, status: int = 200) -> None:
         payload = json.dumps(value).encode("utf-8")
         try:
@@ -504,6 +750,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
@@ -514,19 +761,37 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         route = urlparse(self.path).path
         if route == "/api/status":
+            if not self.api_authorized():
+                self.reject_request()
+                return
             self.json_response(current_status())
             return
         if route == "/":
-            payload = HTML.encode("utf-8")
+            if not self.request_host_valid():
+                self.reject_request()
+                return
+            payload = HTML.replace("__HS_API_TOKEN__", API_TOKEN).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'; connect-src 'self'",
+            )
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
             self.end_headers()
             self.wfile.write(payload)
             return
         self.send_error(404)
 
     def do_POST(self):
+        if not self.api_authorized():
+            self.reject_request()
+            return
         route = urlparse(self.path).path
         if route == "/api/launch":
             self.json_response(launch_game())
@@ -536,6 +801,9 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(open_game_folder())
         else:
             self.send_error(404)
+
+    def do_OPTIONS(self):
+        self.reject_request()
 
 
 class LauncherServer(ThreadingHTTPServer):
