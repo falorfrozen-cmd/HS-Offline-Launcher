@@ -287,51 +287,49 @@ class StatusTests(unittest.TestCase):
         self.assertIn("playing||s.ready?s.game.validation:s.blocker", launcher.HTML)
         self.assertIn('id="validation"', launcher.HTML)
 
+    def test_ui_distinguishes_unknown_eac_from_active(self) -> None:
+        self.assertIn("s.eacService==='running'", launcher.HTML)
+        self.assertIn("s.eacService==='transitioning'", launcher.HTML)
+        self.assertIn("eacPending?'CHECKING':'UNKNOWN'", launcher.HTML)
+
 
 class EacServiceTests(unittest.TestCase):
-    def query_result(self, stdout: str, returncode: int = 0) -> mock.Mock:
-        return mock.Mock(stdout=stdout, returncode=returncode)
-
-    def test_state_parser_ignores_service_type_number(self) -> None:
-        output = """SERVICE_NAME: EasyAntiCheat_EOS
-        TYPE               : 10  WIN32_OWN_PROCESS
-        STATE              : 4  RUNNING
-"""
+    def test_numeric_service_state_is_locale_independent(self) -> None:
         with mock.patch.object(
-            launcher.subprocess,
-            "run",
-            return_value=self.query_result(output),
-        ) as run:
+            launcher,
+            "windows_service_state",
+            return_value=(launcher.SERVICE_RUNNING, 0),
+        ) as query:
             status = launcher.eac_service_status()
 
         self.assertEqual(status, "running")
-        self.assertEqual(run.call_args.args[0], [str(launcher.SC_EXE), "query", "EasyAntiCheat_EOS"])
+        query.assert_called_once_with(launcher.EAC_SERVICE_NAME)
 
     def test_stopped_and_transitioning_states_are_distinguished(self) -> None:
         with mock.patch.object(
-            launcher.subprocess,
-            "run",
-            return_value=self.query_result("        STATE : 1  STOPPED\n"),
+            launcher,
+            "windows_service_state",
+            return_value=(launcher.SERVICE_STOPPED, 0),
         ):
             self.assertEqual(launcher.eac_service_status(), "stopped")
         with mock.patch.object(
-            launcher.subprocess,
-            "run",
-            return_value=self.query_result("        STATE : 2  START_PENDING\n"),
+            launcher,
+            "windows_service_state",
+            return_value=(2, 0),
         ):
             self.assertEqual(launcher.eac_service_status(), "transitioning")
 
     def test_only_missing_service_is_treated_as_inactive(self) -> None:
         with mock.patch.object(
-            launcher.subprocess,
-            "run",
-            return_value=self.query_result("", returncode=1060),
+            launcher,
+            "windows_service_state",
+            return_value=(None, launcher.ERROR_SERVICE_DOES_NOT_EXIST),
         ):
             self.assertEqual(launcher.eac_service_status(), "not-installed")
         with mock.patch.object(
-            launcher.subprocess,
-            "run",
-            return_value=self.query_result("Access is denied", returncode=5),
+            launcher,
+            "windows_service_state",
+            return_value=(None, 5),
         ):
             self.assertEqual(launcher.eac_service_status(), "unknown")
 

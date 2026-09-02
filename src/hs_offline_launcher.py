@@ -44,6 +44,7 @@ STEAM_RUNTIME_NAME = "steam_api64.dll"
 PE_MACHINE_AMD64 = 0x8664
 MAX_PE_OFFSET = 16 * 1024 * 1024
 INACTIVE_EAC_STATES = frozenset({"stopped", "not-installed"})
+EAC_SERVICE_NAME = "EasyAntiCheat_EOS"
 EAC_PROCESS_NAMES = frozenset({
     "easyanticheat.exe",
     "easyanticheat_eos.exe",
@@ -52,12 +53,17 @@ EAC_PROCESS_NAMES = frozenset({
 })
 
 WINDOWS_DIR = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-SC_EXE = WINDOWS_DIR / "System32" / "sc.exe"
 EXPLORER_EXE = WINDOWS_DIR / "explorer.exe"
 API_HEADER = "X-HS-Launcher-Token"
 API_TOKEN = secrets.token_urlsafe(32)
 
-CREATE_NO_WINDOW = 0x08000000
+SC_MANAGER_CONNECT = 0x0001
+SERVICE_QUERY_STATUS = 0x0004
+SC_STATUS_PROCESS_INFO = 0
+SERVICE_STOPPED = 1
+SERVICE_RUNNING = 4
+ERROR_CALL_NOT_IMPLEMENTED = 120
+ERROR_SERVICE_DOES_NOT_EXIST = 1060
 WEBVIEW_WINDOW = None
 SERVER = None
 SERVER_THREAD = None
@@ -216,6 +222,20 @@ class PROCESSENTRY32W(ctypes.Structure):
     ]
 
 
+class SERVICE_STATUS_PROCESS(ctypes.Structure):
+    _fields_ = [
+        ("dwServiceType", wintypes.DWORD),
+        ("dwCurrentState", wintypes.DWORD),
+        ("dwControlsAccepted", wintypes.DWORD),
+        ("dwWin32ExitCode", wintypes.DWORD),
+        ("dwServiceSpecificExitCode", wintypes.DWORD),
+        ("dwCheckPoint", wintypes.DWORD),
+        ("dwWaitHint", wintypes.DWORD),
+        ("dwProcessId", wintypes.DWORD),
+        ("dwServiceFlags", wintypes.DWORD),
+    ]
+
+
 def processes() -> list[tuple[int, str]]:
     if os.name != "nt":
         return []
@@ -252,26 +272,67 @@ def matching_processes(*names: str) -> list[tuple[int, str]]:
     return [(pid, name) for pid, name in processes() if name.lower() in wanted]
 
 
-def eac_service_status() -> str:
+def windows_service_state(service_name: str) -> tuple[int | None, int]:
+    """Return a locale-independent SCM state and the Win32 error code."""
+    if os.name != "nt":
+        return None, ERROR_CALL_NOT_IMPLEMENTED
+
     try:
-        completed = subprocess.run(
-            [str(SC_EXE), "query", "EasyAntiCheat_EOS"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            creationflags=CREATE_NO_WINDOW,
-        )
-        match = re.search(r"^\s*STATE\s*:\s*(\d+)\b", completed.stdout, flags=re.IGNORECASE | re.MULTILINE)
-        if match:
-            state = int(match.group(1))
-            if state == 1:
-                return "stopped"
-            if state == 4:
-                return "running"
-            return "transitioning"
-        return "not-installed" if completed.returncode == 1060 else "unknown"
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        advapi32.OpenSCManagerW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        advapi32.OpenSCManagerW.restype = wintypes.HANDLE
+        advapi32.OpenServiceW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD]
+        advapi32.OpenServiceW.restype = wintypes.HANDLE
+        advapi32.QueryServiceStatusEx.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPBYTE,
+            wintypes.DWORD,
+            wintypes.LPDWORD,
+        ]
+        advapi32.QueryServiceStatusEx.restype = wintypes.BOOL
+        advapi32.CloseServiceHandle.argtypes = [wintypes.HANDLE]
+        advapi32.CloseServiceHandle.restype = wintypes.BOOL
+    except (AttributeError, OSError):
+        return None, ERROR_CALL_NOT_IMPLEMENTED
+
+    manager = advapi32.OpenSCManagerW(None, None, SC_MANAGER_CONNECT)
+    if not manager:
+        return None, ctypes.get_last_error()
+    try:
+        service = advapi32.OpenServiceW(manager, service_name, SERVICE_QUERY_STATUS)
+        if not service:
+            return None, ctypes.get_last_error()
+        try:
+            status = SERVICE_STATUS_PROCESS()
+            bytes_needed = wintypes.DWORD()
+            buffer = ctypes.cast(ctypes.byref(status), wintypes.LPBYTE)
+            if not advapi32.QueryServiceStatusEx(
+                service,
+                SC_STATUS_PROCESS_INFO,
+                buffer,
+                ctypes.sizeof(status),
+                ctypes.byref(bytes_needed),
+            ):
+                return None, ctypes.get_last_error()
+            return int(status.dwCurrentState), 0
+        finally:
+            advapi32.CloseServiceHandle(service)
+    finally:
+        advapi32.CloseServiceHandle(manager)
+
+
+def eac_service_status() -> str:
+    state, error = windows_service_state(EAC_SERVICE_NAME)
+    if state == SERVICE_STOPPED:
+        return "stopped"
+    if state == SERVICE_RUNNING:
+        return "running"
+    if state is not None:
+        return "transitioning"
+    if error == ERROR_SERVICE_DOES_NOT_EXIST:
+        return "not-installed"
+    return "unknown"
 
 
 def eac_is_inactive(status: str) -> bool:
@@ -710,7 +771,7 @@ const $=id=>document.getElementById(id);const API_TOKEN='__HS_API_TOKEN__';let b
 async function api(path,method='GET'){const headers={'X-HS-Launcher-Token':API_TOKEN};if(method!=='GET')headers['Content-Type']='application/json';const r=await fetch(path,{method,headers});const body=await r.json();if(!r.ok)throw new Error(body.err||('HTTP '+r.status));return body}
 function state(el,good,text){el.className=good===true?'good':good===false?'bad':'warn';el.innerHTML='<i class="dot"></i>'+text}
 function activity(text,kind='',holdMs=0){const strong=document.createElement('strong');strong.textContent=text;strong.className=kind;$('activity').replaceChildren(strong);if(holdMs)activityPinnedUntil=Date.now()+holdMs}
-async function refresh(){try{const s=await api('/api/status');$('path').textContent=s.game.path||'Not selected';$('build').textContent=s.game.build;state($('steam'),s.steamRunning,s.steamRunning?'Running':(s.steamFound?'Ready':'Not found'));state($('eac'),s.safe,s.safe?'Inactive':'ACTIVE');state($('game'),s.gameRunning,s.gameRunning?'Running':'Closed');$('launch').disabled=busy||!s.ready;const playing=s.gameRunning&&s.safe;$('overall').textContent=playing?'PLAYING OFFLINE':s.ready?'READY':s.gameRunning?'CHECK':'SETUP NEEDED';$('overall').className='badge '+(playing||s.ready?'good':s.gameRunning?'warn':'bad');$('validation').textContent=playing||s.ready?s.game.validation:s.blocker;$('validation').className='validation '+(playing||s.ready?(s.game.modified?'warn':'good'):'bad');if(!busy&&Date.now()>=activityPinnedUntil){const last=s.lastLaunch.message;const fallback=playing?'Game is running offline; EAC is inactive.':s.ready?'Ready to launch offline.':s.blocker;activity(last&&last!=='Ready'?last:fallback,playing||s.ready?'good':s.gameRunning?'warn':'bad')}}catch(e){activity('Status error: '+e,'bad',6000)}}
+async function refresh(){try{const s=await api('/api/status');$('path').textContent=s.game.path||'Not selected';$('build').textContent=s.game.build;state($('steam'),s.steamRunning,s.steamRunning?'Running':(s.steamFound?'Ready':'Not found'));const eacActive=s.eacService==='running'||s.eacProcesses.length>0;const eacPending=s.eacService==='transitioning';state($('eac'),s.safe?true:eacActive?false:null,s.safe?'Inactive':eacActive?'ACTIVE':eacPending?'CHECKING':'UNKNOWN');state($('game'),s.gameRunning,s.gameRunning?'Running':'Closed');$('launch').disabled=busy||!s.ready;const playing=s.gameRunning&&s.safe;$('overall').textContent=playing?'PLAYING OFFLINE':s.ready?'READY':s.gameRunning?'CHECK':'SETUP NEEDED';$('overall').className='badge '+(playing||s.ready?'good':s.gameRunning?'warn':'bad');$('validation').textContent=playing||s.ready?s.game.validation:s.blocker;$('validation').className='validation '+(playing||s.ready?(s.game.modified?'warn':'good'):'bad');if(!busy&&Date.now()>=activityPinnedUntil){const last=s.lastLaunch.message;const fallback=playing?'Game is running offline; EAC is inactive.':s.ready?'Ready to launch offline.':s.blocker;activity(last&&last!=='Ready'?last:fallback,playing||s.ready?'good':s.gameRunning?'warn':'bad')}}catch(e){activity('Status error: '+e,'bad',6000)}}
 async function launchGame(){busy=true;$('launch').disabled=true;activity('Launching… Waiting for the game process.');try{const r=await api('/api/launch','POST');activity(r.err||r.ok,r.err?'bad':'good',6000)}catch(e){activity('Launch failed: '+e,'bad',6000)}finally{busy=false;await refresh()}}
 async function browse(){if(busy)return;busy=true;$('launch').disabled=true;activity('Opening the game picker…');try{let r;if(window.pywebview&&window.pywebview.api){r=await window.pywebview.api.select_exe()}else{r=await api('/api/select','POST')}if(r.err){activity(r.err,'bad',6000)}else if(r.cancelled){activity('Selection cancelled.','',3000)}else{activity(r.ok,'good',3000)}}catch(e){activity('Browse failed: '+e,'bad',6000)}finally{busy=false;await refresh()}}
 async function folder(){try{const r=await api('/api/folder','POST');if(r.err)activity(r.err,'bad',6000)}catch(e){activity('Folder failed: '+e,'bad',6000)}}

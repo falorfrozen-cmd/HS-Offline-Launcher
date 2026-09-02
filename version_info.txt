@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    filevers=(1, 0, 1, 0),
+    prodvers=(1, 0, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'falorfrozen-cmd'),
           StringStruct('FileDescription', 'HS Offline Launcher'),
-          StringStruct('FileVersion', '1.0.0.0'),
+          StringStruct('FileVersion', '1.0.1.0'),
           StringStruct('InternalName', 'HS-Offline-Launcher'),
           StringStruct('LegalCopyright', 'Copyright (c) 2026 falorfrozen-cmd'),
           StringStruct('OriginalFilename', 'HS-Offline-Launcher.exe'),
           StringStruct('ProductName', 'HS Offline Launcher'),
-          StringStruct('ProductVersion', '1.0.0'),
+          StringStruct('ProductVersion', '1.0.1'),
           StringStruct('Comments', 'Built from the public MIT-licensed source')
         ]
       )
