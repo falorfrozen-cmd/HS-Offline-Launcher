@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
+import re
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,6 +19,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import hs_offline_launcher as launcher  # noqa: E402
+
+LAUNCHER_SOURCE = (PROJECT_ROOT / "src" / "hs_offline_launcher.py").read_text(encoding="utf-8")
 
 
 def write_test_pe(path: Path, *, sections: tuple[str, ...] = (".text",), machine: int = 0x8664) -> Path:
@@ -51,7 +58,7 @@ class GameValidationTests(unittest.TestCase):
         self.exe = write_test_pe(self.root / "HeroSiege" / "bin" / "Hero_Siege.exe")
 
     def tearDown(self) -> None:
-        launcher.HASH_CACHE.clear()
+        launcher.reset_caches()
         self.temp_dir.cleanup()
 
     def add_runtime(self, directory: Path | None = None) -> Path:
@@ -199,7 +206,7 @@ class StatusTests(unittest.TestCase):
         (self.exe.parent / launcher.STEAM_RUNTIME_NAME).write_bytes(b"runtime")
 
     def tearDown(self) -> None:
-        launcher.HASH_CACHE.clear()
+        launcher.reset_caches()
         self.temp_dir.cleanup()
 
     def status(self, *, steam_found: bool = True) -> dict:
@@ -386,7 +393,7 @@ class FolderOpeningTests(unittest.TestCase):
         (self.exe.parent / launcher.STEAM_RUNTIME_NAME).write_bytes(b"runtime")
 
     def tearDown(self) -> None:
-        launcher.HASH_CACHE.clear()
+        launcher.reset_caches()
         self.temp_dir.cleanup()
 
     def test_only_validated_game_directory_is_opened(self) -> None:
@@ -473,6 +480,262 @@ class LocalServerSecurityTests(unittest.TestCase):
         self.assertEqual(post_status, 403)
         self.assertEqual(options_status, 403)
         launch.assert_not_called()
+
+
+class ExeFactsCacheTests(unittest.TestCase):
+    """The status poll parses the game's PE header, and used to do it twice.
+
+    None of the exe-derived facts can change while the game is running, which
+    is what makes a cache safe - but only if a CHANGED file can never be
+    served from one. The key is (path, size, mtime_ns), the same shape
+    file_sha256 already uses, and the launch path does not read the cache at
+    all: a launch decision served from a cache is the one failure this must
+    not have.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.exe = write_test_pe(self.root / "HeroSiege" / "bin" / "Hero_Siege.exe")
+        (self.exe.parent / launcher.STEAM_RUNTIME_NAME).write_bytes(b"steam runtime fixture")
+        launcher.reset_caches()
+
+    def tearDown(self) -> None:
+        launcher.reset_caches()
+        self.temp_dir.cleanup()
+
+    def test_one_header_parse_per_game_details(self) -> None:
+        real = launcher.pe_section_names
+        calls = []
+
+        def counted(path):
+            calls.append(path)
+            return real(path)
+
+        with mock.patch.object(launcher, "pe_section_names", side_effect=counted):
+            details = launcher.game_details(self.exe)
+
+        self.assertEqual(len(calls), 1, "validate_game and the .aurie check parsed it twice")
+        self.assertTrue(details["valid"])
+
+    def test_game_details_is_unchanged_for_a_clean_executable(self) -> None:
+        details = launcher.game_details(self.exe)
+        self.assertEqual(details["valid"], True)
+        self.assertEqual(details["validation"], "Clean Steam executable")
+        self.assertEqual(details["build"], "New/unknown Steam build")
+        self.assertEqual(details["known"], False)
+        self.assertEqual(details["modified"], False)
+        self.assertEqual(details["size"], self.exe.stat().st_size)
+
+    def test_game_details_is_unchanged_for_an_aurie_executable(self) -> None:
+        write_test_pe(self.exe, sections=(".text", ".aurie"))
+        launcher.reset_caches()
+        details = launcher.game_details(self.exe)
+        self.assertEqual(details["valid"], True)
+        self.assertIn("offline use only", details["validation"])
+        self.assertEqual(details["build"], "Modified/custom Hero Siege build")
+        self.assertEqual(details["known"], False)
+        self.assertEqual(details["modified"], True)
+
+    def test_game_details_is_unchanged_for_an_invalid_file(self) -> None:
+        self.exe.write_bytes(b"not a PE at all")
+        launcher.reset_caches()
+        details = launcher.game_details(self.exe)
+        self.assertEqual(details["valid"], False)
+        self.assertIn("not a valid Hero Siege Windows executable", details["validation"])
+        self.assertEqual(details["build"], "Invalid selection")
+        self.assertEqual(details["known"], False)
+        self.assertEqual(details["modified"], False)
+        self.assertEqual(details["size"], self.exe.stat().st_size)
+
+    def test_the_cache_is_dropped_when_the_executable_changes(self) -> None:
+        self.assertFalse(launcher.game_details(self.exe)["modified"])
+        stat = self.exe.stat()
+        write_test_pe(self.exe, sections=(".text", ".aurie"))
+        # Force a distinct mtime_ns: two fixtures written back to back can land
+        # inside one filesystem timestamp tick.
+        os.utime(self.exe, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        self.assertTrue(launcher.game_details(self.exe)["modified"])
+
+    def test_the_launch_path_does_not_read_the_cache(self) -> None:
+        # Warm the cache with a valid exe, then replace it with a same-size
+        # 32-bit PE and restore the original mtime_ns so the key is unchanged.
+        # The status display may keep showing the cached answer; the launch
+        # must not, because that is the decision that starts a process.
+        warm = launcher.game_details(self.exe)
+        self.assertTrue(warm["valid"])
+        stat = self.exe.stat()
+        write_test_pe(self.exe, machine=0x014C)
+        self.assertEqual(self.exe.stat().st_size, stat.st_size,
+                         "the fixture must keep the cache key stable")
+        os.utime(self.exe, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+        self.assertTrue(launcher.game_details(self.exe)["valid"], "the cached key is unchanged")
+
+        with (
+            mock.patch.object(launcher, "load_config", return_value={"game_exe": str(self.exe)}),
+            mock.patch.object(launcher, "processes", return_value=[]),
+            mock.patch.object(launcher, "eac_service_status", return_value="stopped"),
+            mock.patch.object(launcher, "start_steam_if_needed", return_value=(True, "Steam is running")),
+            mock.patch.object(launcher.subprocess, "Popen") as popen,
+        ):
+            result = launcher.launch_game_locked()
+
+        self.assertIn("not a valid Hero Siege Windows executable", result["err"])
+        popen.assert_not_called()
+
+    def test_the_launch_path_asks_for_an_uncached_answer_explicitly(self) -> None:
+        source = LAUNCHER_SOURCE
+        self.assertIn("use_cache", source)
+        body = source.split("def launch_game_locked(", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("use_cache=False", body)
+
+    def test_the_safety_gate_is_never_cached(self) -> None:
+        # processes() and eac_service_status() are the safety gate. A cached
+        # "nothing is running" is a launch into a live EAC session.
+        body = LAUNCHER_SOURCE.split("def launch_safety_blocker(", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("rows = processes()", body)
+        self.assertIn("eac_service_status()", body)
+        self.assertNotIn("CACHE", body)
+
+    def test_the_hash_cache_says_why_it_is_size_one(self) -> None:
+        # Out of scope to "fix": it is already keyed by (path, size, mtime_ns),
+        # so the 280 MB file is not re-hashed per poll. The comment is there so
+        # the next reader does not mistake the clear() for a bug.
+        body = LAUNCHER_SOURCE.split("def file_sha256(", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("HASH_CACHE.clear()", body)
+        self.assertIn("one game executable", body)
+
+    def test_the_exe_fact_cache_is_guarded_by_a_lock(self) -> None:
+        # Handler threads share it (ThreadingHTTPServer, daemon_threads). The
+        # allowed race is two threads parsing the same header at once; a launch
+        # decision served from a cache is not allowed at all, which is why the
+        # launch path bypasses it rather than locking harder.
+        self.assertIsInstance(launcher.EXE_FACTS_LOCK, type(threading.Lock()))
+        errors = []
+
+        def hammer():
+            try:
+                for _ in range(40):
+                    assert launcher.game_details(self.exe)["valid"]
+            except Exception as exc:  # pragma: no cover - only on a real race
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+
+
+class PollPolicyTests(unittest.TestCase):
+    """The status poll's rate, shared verbatim with ForgePact's panel."""
+
+    POLL_CONSTANTS = ("POLL_FAST_MS", "POLL_IDLE_MS", "POLL_FAST_WINDOW_MS")
+    PANEL_SRC = PROJECT_ROOT.parent / "ForgePact" / "src" / "forgepact.py"
+
+    @staticmethod
+    def js_constants(source: str) -> dict:
+        return {m.group(1): int(m.group(2))
+                for m in re.finditer(r"const\s+(POLL_[A-Z_]+)\s*=\s*(\d+)\s*;", source)}
+
+    @staticmethod
+    def run_node(policy_js: str, driver_js: str) -> dict:
+        node = shutil.which("node")
+        if not node:
+            raise unittest.SkipTest(
+                "node is not on PATH; the poll policy's structure is still asserted, "
+                "but its truth table needs a JavaScript runtime to execute")
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "policy.js"
+            script.write_text(policy_js + "\n" + driver_js, encoding="utf-8")
+            result = subprocess.run([node, str(script)], capture_output=True, text=True)
+            if result.returncode:
+                raise AssertionError(result.stdout + result.stderr)
+            return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_the_policy_is_a_named_constant_concatenated_into_the_page(self) -> None:
+        self.assertTrue(hasattr(launcher, "POLL_POLICY_JS"))
+        self.assertIn("pollDelayMs(", launcher.POLL_POLICY_JS)
+        for name in self.POLL_CONSTANTS:
+            self.assertIn(name, launcher.POLL_POLICY_JS)
+        self.assertIn(launcher.POLL_POLICY_JS, launcher.HTML)
+
+    def test_the_fixed_two_second_timer_is_gone(self) -> None:
+        self.assertNotIn("setInterval(refresh,2000)", launcher.HTML)
+        self.assertNotIn("setInterval", launcher.HTML)
+
+    def test_a_hidden_window_is_gated(self) -> None:
+        self.assertIn("document.hidden", launcher.HTML)
+        self.assertIn("visibilitychange", launcher.HTML)
+
+    def test_the_watched_fields_are_declared(self) -> None:
+        self.assertEqual(
+            launcher.POLL_WATCHED_FIELDS,
+            ["gameRunning", "safe", "ready", "eacService", "blocker",
+             "steamRunning", "steamFound", "game.build", "game.path"])
+        for field in launcher.POLL_WATCHED_FIELDS:
+            self.assertIn(f'"{field}"', launcher.POLL_POLICY_JS)
+
+    def test_both_apps_share_the_same_constants(self) -> None:
+        if not self.PANEL_SRC.is_file():
+            raise unittest.SkipTest(
+                f"{self.PANEL_SRC} is not checked out; the shared poll policy's "
+                "constants can only be compared inside a full toolkit checkout")
+        mine = self.js_constants(LAUNCHER_SOURCE)
+        theirs = self.js_constants(self.PANEL_SRC.read_text(encoding="utf-8"))
+        for name in self.POLL_CONSTANTS:
+            self.assertIn(name, mine)
+            self.assertIn(name, theirs)
+            self.assertEqual(mine[name], theirs[name],
+                             f"{name} differs between the launcher and the panel")
+
+    def test_the_delay_truth_table_executes(self) -> None:
+        driver = """
+console.log(JSON.stringify({
+  fast: POLL_FAST_MS, idle: POLL_IDLE_MS, window: POLL_FAST_WINDOW_MS,
+  fields: POLL_WATCHED_FIELDS,
+  hiddenNow: pollDelayMs(true, 0),
+  hiddenLater: pollDelayMs(true, 999999),
+  freshChange: pollDelayMs(false, 0),
+  justInside: pollDelayMs(false, 14999),
+  atBoundary: pollDelayMs(false, 15000),
+  longIdle: pollDelayMs(false, 999999)
+}));
+"""
+        got = self.run_node(launcher.POLL_POLICY_JS, driver)
+        self.assertIsNone(got["hiddenNow"])
+        self.assertIsNone(got["hiddenLater"])
+        self.assertEqual(got["freshChange"], got["fast"])
+        self.assertEqual(got["justInside"], got["fast"])
+        self.assertEqual(got["atBoundary"], got["idle"])
+        self.assertEqual(got["longIdle"], got["idle"])
+        self.assertEqual(got["fields"], launcher.POLL_WATCHED_FIELDS)
+
+    def test_the_change_detector_executes(self) -> None:
+        # Including a nested watched field (game.build), which is why the
+        # comparison walks a dotted path instead of indexing once.
+        driver = """
+const A={gameRunning:false,safe:true,ready:true,eacService:"stopped",blocker:"",
+         steamRunning:true,steamFound:true,game:{build:"Season 10",path:"C:/g.exe",hash:"a"}};
+const same=JSON.parse(JSON.stringify(A));
+const unwatched=JSON.parse(JSON.stringify(A)); unwatched.game.hash="b";
+const nested=JSON.parse(JSON.stringify(A)); nested.game.build="Season 11";
+console.log(JSON.stringify({
+  identical: pollNextChangeAt(A, same, false, 9000, 100),
+  unwatched: pollNextChangeAt(A, unwatched, false, 9000, 100),
+  nested: pollNextChangeAt(A, nested, false, 9000, 100),
+  localAction: pollNextChangeAt(A, same, true, 9000, 100),
+  firstPayload: pollNextChangeAt(null, A, false, 9000, 100)
+}));
+"""
+        got = self.run_node(launcher.POLL_POLICY_JS, driver)
+        self.assertEqual(got["identical"], 100, "an identical payload must not reset the clock")
+        self.assertEqual(got["unwatched"], 100, "an unwatched field must not reset the clock")
+        self.assertEqual(got["nested"], 9000, "a nested watched field difference resets the clock")
+        self.assertEqual(got["localAction"], 9000, "a local action resets the clock")
+        self.assertEqual(got["firstPayload"], 9000, "the first payload counts as a change")
 
 
 if __name__ == "__main__":
