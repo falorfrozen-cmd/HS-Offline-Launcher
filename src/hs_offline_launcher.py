@@ -70,6 +70,10 @@ SERVER_THREAD = None
 LAUNCH_LOCK = threading.Lock()
 LAST_LAUNCH = {"pid": 0, "time": "", "message": "Ready"}
 HASH_CACHE: dict[tuple[str, int, int], str] = {}
+# PE facts for the selected executable, keyed the same way and read by the
+# status path only. See _exe_facts() for why the launch path bypasses it.
+EXE_FACTS_CACHE: dict[tuple[str, int, int], dict] = {}
+EXE_FACTS_LOCK = threading.Lock()
 
 
 def ensure_state_dir() -> None:
@@ -343,6 +347,13 @@ def eac_processes() -> list[tuple[int, str]]:
     return [(pid, name) for pid, name in processes() if name.lower() in EAC_PROCESS_NAMES]
 
 
+def reset_caches() -> None:
+    """Drop every derived-fact cache (tests, and anything that moves the exe)."""
+    HASH_CACHE.clear()
+    with EXE_FACTS_LOCK:
+        EXE_FACTS_CACHE.clear()
+
+
 def file_sha256(path: Path) -> str:
     stat = path.stat()
     key = (str(path).lower(), stat.st_size, stat.st_mtime_ns)
@@ -353,9 +364,54 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
             digest.update(block)
     value = digest.hexdigest()
+    # Deliberately size 1: there is only ever one game executable selected, and
+    # the key carries its size and mtime_ns, so a changed file can never be
+    # served from here. Keeping older entries would only pin the 280 MB digest
+    # of a file nobody is looking at any more.
     HASH_CACHE.clear()
     HASH_CACHE[key] = value
     return value
+
+
+def _exe_facts(path: Path, use_cache: bool = True) -> dict:
+    """One stat() and one PE header parse for the selected executable.
+
+    game_details() used to parse the header twice per status poll - once
+    inside validate_game() and once again for the .aurie check - and the UI
+    polled every two seconds for the whole session.
+
+    None of these facts can change while the game is running, which is what
+    makes a cache safe; the key is (path, size, mtime_ns), the same shape
+    file_sha256 already uses, so a changed file is a different key. The stat()
+    that produces the key stays: it is metadata-only and O(1) whatever the file
+    size, and it is not what costs.
+
+    The lock is here because handler threads share this
+    (ThreadingHTTPServer, daemon_threads). The allowed race is two threads
+    parsing the same header at once - redundant, identical. What is NOT
+    allowed is a launch decision served from a cache, and that is prevented
+    structurally rather than by locking harder: launch_game_locked() passes
+    use_cache=False, and the process/EAC safety gate is never cached at all.
+    """
+    stat = path.stat()
+    key = (str(path).lower(), stat.st_size, stat.st_mtime_ns)
+    if use_cache:
+        with EXE_FACTS_LOCK:
+            cached = EXE_FACTS_CACHE.get(key)
+        if cached is not None:
+            return cached
+    facts: dict = {"size": stat.st_size, "sections": set(), "error": None}
+    try:
+        facts["sections"] = pe_section_names(path)
+    except ValueError as exc:
+        facts["error"] = ("invalid", str(exc))
+    except OSError as exc:
+        facts["error"] = ("unreadable", str(exc))
+    if use_cache:
+        with EXE_FACTS_LOCK:
+            EXE_FACTS_CACHE.clear()          # size 1, for the same reason as HASH_CACHE
+            EXE_FACTS_CACHE[key] = facts
+    return facts
 
 
 def pe_section_names(path: Path) -> set[str]:
@@ -416,20 +472,29 @@ def find_steam_runtime(path: Path) -> Path | None:
     return None
 
 
-def validate_game(path: Path | None) -> tuple[bool, str]:
+def validate_game(path: Path | None, use_cache: bool = True) -> tuple[bool, str]:
+    """Is this a Hero Siege executable we are willing to start?
+
+    use_cache=False is not an optimisation switch: the launch path passes it so
+    that the decision which actually starts a process is always made against
+    the file as it is right now, never against a status poll's memory of it.
+    """
     if path is None or not path.is_file():
         return False, "Hero_Siege.exe was not found"
     if path.name.lower() != "hero_siege.exe":
         return False, "Select the clean Hero_Siege.exe, not a modded or protected launcher"
     try:
-        sections = pe_section_names(path)
-    except ValueError as exc:
-        return False, f"The selected file is not a valid Hero Siege Windows executable ({exc})"
+        facts = _exe_facts(path, use_cache=use_cache)
     except OSError as exc:
         return False, f"The executable could not be read: {exc}"
+    if facts["error"]:
+        kind, detail = facts["error"]
+        if kind == "invalid":
+            return False, f"The selected file is not a valid Hero Siege Windows executable ({detail})"
+        return False, f"The executable could not be read: {detail}"
     if not find_steam_runtime(path):
         return False, "steam_api64.dll is missing. Verify Hero Siege files in Steam, then try again."
-    if ".aurie" in sections:
+    if ".aurie" in facts["sections"]:
         return True, "Compatible Aurie/ForgePact build — offline use only"
     return True, "Clean Steam executable"
 
@@ -438,17 +503,22 @@ def game_details(path: Path | None) -> dict:
     valid, reason = validate_game(path)
     exists = bool(path and path.is_file())
     modified = False
-    if valid and path:
+    size = 0
+    if exists and path:
+        # Already parsed by validate_game a moment ago, so this is the cache
+        # hit that removed the second header parse per poll.
         try:
-            modified = ".aurie" in pe_section_names(path)
-        except (OSError, ValueError):
+            facts = _exe_facts(path)
+            size = facts["size"]
+            modified = valid and ".aurie" in facts["sections"]
+        except OSError:
             pass
     result = {
         "path": str(path) if path else "",
         "exists": exists,
         "valid": valid,
         "validation": reason,
-        "size": path.stat().st_size if exists and path else 0,
+        "size": size,
         "hash": "",
         "build": "Checking…" if valid else ("Game not found" if not exists else "Invalid selection"),
         "known": False,
@@ -578,7 +648,9 @@ def launch_safety_blocker() -> str:
 def launch_game_locked() -> dict:
     cfg = load_config()
     path = configured_game_path(cfg)
-    valid, reason = validate_game(path)
+    # use_cache=False: the status poll may serve a remembered answer, the
+    # decision that starts a process may not.
+    valid, reason = validate_game(path, use_cache=False)
     if not valid:
         return {"err": reason}
     assert path is not None
@@ -749,6 +821,61 @@ def open_game_folder() -> dict:
     return {"ok": "Game folder opened"}
 
 
+
+# ---- adaptive poll policy --------------------------------------------------
+# Shared, deliberately verbatim, with ForgePact/src/forgepact.py: same
+# function, same three constant names, same values. A fixed interval forces a
+# trade nobody wins - fast costs poll work for the whole session, slow costs
+# feedback latency at exactly the moments somebody is watching. The trade only
+# exists because the interval is fixed, and both clients can already tell when
+# a change is plausible: the user just pressed something, or the payload they
+# just received differs from the previous one.
+#
+# Known gap, documented rather than special-cased: a window OCCLUDED by a
+# fullscreen game is not necessarily document.hidden, so it idles (one poll
+# per 30 s) instead of suspending.
+#
+# Kept as a named constant instead of being buried in an inline arrow so the
+# tests can assert its structure always and execute it through node when one
+# is installed.
+POLL_WATCHED_FIELDS = [
+    "gameRunning", "safe", "ready", "eacService", "blocker",
+    "steamRunning", "steamFound", "game.build", "game.path",
+]
+
+POLL_POLICY_JS = r"""
+const POLL_FAST_MS = 2000;          // something just happened; the user is watching
+const POLL_IDLE_MS = 30000;         // nothing has changed for a while
+const POLL_FAST_WINDOW_MS = 15000;  // how long "just happened" lasts
+const POLL_WATCHED_FIELDS = __POLL_WATCHED_FIELDS__;
+// null means: do not schedule a poll at all.
+function pollDelayMs(hidden, msSinceChange){
+  if(hidden) return null;
+  return msSinceChange < POLL_FAST_WINDOW_MS ? POLL_FAST_MS : POLL_IDLE_MS;
+}
+// Watched fields are dotted paths so a nested one (game.build) reads the same
+// way as a flat one.
+function pollFieldValue(payload, field){
+  let cur = payload;
+  for(const part of field.split('.')){
+    if(cur === null || cur === undefined) return undefined;
+    cur = cur[part];
+  }
+  return cur;
+}
+function pollPayloadChanged(prev, next){
+  if(!prev) return true;
+  return POLL_WATCHED_FIELDS.some(f =>
+    JSON.stringify(pollFieldValue(prev, f)) !== JSON.stringify(pollFieldValue(next, f)));
+}
+// The change clock: a local action, or an observed difference in a watched
+// field, resets it. Anything else leaves it where it was.
+function pollNextChangeAt(prev, next, localAction, now, lastChange){
+  return (localAction || pollPayloadChanged(prev, next)) ? now : lastChange;
+}
+""".replace("__POLL_WATCHED_FIELDS__", json.dumps(POLL_WATCHED_FIELDS))
+
+
 HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>HS Offline Launcher</title>
@@ -767,15 +894,40 @@ button{border:0;border-radius:9px;padding:0 16px;font-weight:700;color:#dce8f2;b
 <section class="card"><h2>Game Location</h2><div class="pathrow"><div class="path" id="path">Detecting game…</div><button onclick="browse()">Browse</button><button onclick="folder()">Folder</button></div><div class="buildline">Build: <strong id="build">—</strong></div><div class="validation warn" id="validation">Checking the selected executable…</div><button class="launch" id="launch" onclick="launchGame()">▶ LAUNCH OFFLINE</button></section>
 <section class="card activity"><h2>Status</h2><div id="activity"><strong>Ready.</strong></div></section></main></div>
 <script>
+""" + POLL_POLICY_JS + r"""
 const $=id=>document.getElementById(id);const API_TOKEN='__HS_API_TOKEN__';let busy=false;let activityPinnedUntil=0;
 async function api(path,method='GET'){const headers={'X-HS-Launcher-Token':API_TOKEN};if(method!=='GET')headers['Content-Type']='application/json';const r=await fetch(path,{method,headers});const body=await r.json();if(!r.ok)throw new Error(body.err||('HTTP '+r.status));return body}
 function state(el,good,text){el.className=good===true?'good':good===false?'bad':'warn';el.innerHTML='<i class="dot"></i>'+text}
 function activity(text,kind='',holdMs=0){const strong=document.createElement('strong');strong.textContent=text;strong.className=kind;$('activity').replaceChildren(strong);if(holdMs)activityPinnedUntil=Date.now()+holdMs}
-async function refresh(){try{const s=await api('/api/status');$('path').textContent=s.game.path||'Not selected';$('build').textContent=s.game.build;state($('steam'),s.steamRunning,s.steamRunning?'Running':(s.steamFound?'Ready':'Not found'));const eacActive=s.eacService==='running'||s.eacProcesses.length>0;const eacPending=s.eacService==='transitioning';state($('eac'),s.safe?true:eacActive?false:null,s.safe?'Inactive':eacActive?'ACTIVE':eacPending?'CHECKING':'UNKNOWN');state($('game'),s.gameRunning,s.gameRunning?'Running':'Closed');$('launch').disabled=busy||!s.ready;const playing=s.gameRunning&&s.safe;$('overall').textContent=playing?'PLAYING OFFLINE':s.ready?'READY':s.gameRunning?'CHECK':'SETUP NEEDED';$('overall').className='badge '+(playing||s.ready?'good':s.gameRunning?'warn':'bad');$('validation').textContent=playing||s.ready?s.game.validation:s.blocker;$('validation').className='validation '+(playing||s.ready?(s.game.modified?'warn':'good'):'bad');if(!busy&&Date.now()>=activityPinnedUntil){const last=s.lastLaunch.message;const fallback=playing?'Game is running offline; EAC is inactive.':s.ready?'Ready to launch offline.':s.blocker;activity(last&&last!=='Ready'?last:fallback,playing||s.ready?'good':s.gameRunning?'warn':'bad')}}catch(e){activity('Status error: '+e,'bad',6000)}}
+async function refresh(){let s=null;try{s=await api('/api/status');$('path').textContent=s.game.path||'Not selected';$('build').textContent=s.game.build;state($('steam'),s.steamRunning,s.steamRunning?'Running':(s.steamFound?'Ready':'Not found'));const eacActive=s.eacService==='running'||s.eacProcesses.length>0;const eacPending=s.eacService==='transitioning';state($('eac'),s.safe?true:eacActive?false:null,s.safe?'Inactive':eacActive?'ACTIVE':eacPending?'CHECKING':'UNKNOWN');state($('game'),s.gameRunning,s.gameRunning?'Running':'Closed');$('launch').disabled=busy||!s.ready;const playing=s.gameRunning&&s.safe;$('overall').textContent=playing?'PLAYING OFFLINE':s.ready?'READY':s.gameRunning?'CHECK':'SETUP NEEDED';$('overall').className='badge '+(playing||s.ready?'good':s.gameRunning?'warn':'bad');$('validation').textContent=playing||s.ready?s.game.validation:s.blocker;$('validation').className='validation '+(playing||s.ready?(s.game.modified?'warn':'good'):'bad');if(!busy&&Date.now()>=activityPinnedUntil){const last=s.lastLaunch.message;const fallback=playing?'Game is running offline; EAC is inactive.':s.ready?'Ready to launch offline.':s.blocker;activity(last&&last!=='Ready'?last:fallback,playing||s.ready?'good':s.gameRunning?'warn':'bad')}}catch(e){s=null;activity('Status error: '+e,'bad',6000)}return s}
 async function launchGame(){busy=true;$('launch').disabled=true;activity('Launching… Waiting for the game process.');try{const r=await api('/api/launch','POST');activity(r.err||r.ok,r.err?'bad':'good',6000)}catch(e){activity('Launch failed: '+e,'bad',6000)}finally{busy=false;await refresh()}}
 async function browse(){if(busy)return;busy=true;$('launch').disabled=true;activity('Opening the game picker…');try{let r;if(window.pywebview&&window.pywebview.api){r=await window.pywebview.api.select_exe()}else{r=await api('/api/select','POST')}if(r.err){activity(r.err,'bad',6000)}else if(r.cancelled){activity('Selection cancelled.','',3000)}else{activity(r.ok,'good',3000)}}catch(e){activity('Browse failed: '+e,'bad',6000)}finally{busy=false;await refresh()}}
 async function folder(){try{const r=await api('/api/folder','POST');if(r.err)activity(r.err,'bad',6000)}catch(e){activity('Folder failed: '+e,'bad',6000)}}
-refresh();setInterval(refresh,2000);
+// Self-scheduling poll: fast while something is happening, idle when nothing
+// is, suspended entirely while the window is hidden.
+let pollTimer=null, pollLastChange=Date.now(), pollPrev=null;
+function schedulePoll(){
+  if(pollTimer){clearTimeout(pollTimer);pollTimer=null}
+  const delay=pollDelayMs(document.hidden,Date.now()-pollLastChange);
+  if(delay===null)return;
+  pollTimer=setTimeout(pollOnce,delay);
+}
+function noteLocalAction(){pollLastChange=Date.now();schedulePoll()}
+async function pollOnce(){
+  pollTimer=null;
+  const s=await refresh();
+  if(s){pollLastChange=pollNextChangeAt(pollPrev,s,false,Date.now(),pollLastChange);pollPrev=s}
+  schedulePoll();
+}
+// One listener instead of a call in every handler: any control the user
+// touches is a local action, and so is pressing Launch.
+['input','change','click'].forEach(ev=>document.addEventListener(ev,noteLocalAction,true));
+document.addEventListener('visibilitychange',()=>{
+  // Coming back: poll at once, so the first thing a returning user sees is
+  // fresh, and reset the clock so the fast tier covers the time they look.
+  if(document.hidden){schedulePoll()}else{pollLastChange=Date.now();pollOnce()}
+});
+pollOnce();
 </script></body></html>"""
 
 
